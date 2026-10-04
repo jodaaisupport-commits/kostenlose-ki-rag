@@ -222,3 +222,17 @@ uploads/*
 !uploads/.gitkeep
 cache/*.joblib
 logs/
+
+# Android / Gradle build artifacts (do NOT commit SDK binaries or local machine config)
+.android-sdk/
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+android/*.hprof
+android/.cxx/
+android/captures/
+*.apk
+*.aab
+local.properties
+.gradle/
