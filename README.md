@@ -1,3 +1,12 @@
+---
+title: Kostenlose KI-Chat-App mit Dokumenten-RAG
+emoji: 🆓
+colorFrom: indigo
+colorTo: blue
+sdk: gradio
+app_file: app.py
+---
+
 # 🆓 Kostenlose KI-Chat-App mit Dokumenten-RAG
 
 Eine vollständig kostenlose KI-Chat-Anwendung mit **Gradio-UI**, die über die
@@ -41,6 +50,14 @@ python app.py
 ```
 
 Die App läuft anschließend standardmäßig auf **http://0.0.0.0:7860**.
+
+## ☁️ Deployment auf Hugging Face Spaces
+
+1. Auf [Hugging Face Spaces](https://huggingface.co/new-space) einen neuen Space erstellen und **Gradio** als SDK wählen.
+2. Den Inhalt dieses Repositorys in den Space übertragen. Die Space-Konfiguration ist bereits in diesem README hinterlegt; `requirements.txt` installiert die Abhängigkeiten.
+3. Optional API-Keys unter **Settings → Variables and secrets** als `GROQ_API_KEY` und/oder `GOOGLE_API_KEY` hinterlegen. Alternativ können die Schlüssel direkt in der App eingegeben werden. Schlüssel niemals in Repository-Dateien eintragen.
+
+Die App startet auf dem von Spaces bereitgestellten Port. Hochgeladene Dokumente und der Index-Cache liegen im Space-Dateisystem und sind ohne aktivierten persistenten Speicher nicht dauerhaft gespeichert.
 
 ## 🔑 Kostenlose API-Keys
 
