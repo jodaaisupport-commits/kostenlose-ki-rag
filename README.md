@@ -13,8 +13,18 @@ Eine vollständig kostenlose KI-Chat-Anwendung mit **Gradio-UI**, die über die
   - **TF-IDF** – läuft komplett lokal, kein zusätzlicher API-Key nötig
   - **Gemini-Embeddings** – semantischere Suche (benötigt Google-Key)
 - 💾 **Persistenter Index-Cache**: einmal indizierte Dokumente werden lokal
-  gecacht (joblib) und beim nächsten Start sofort wiederverwendet
+  gecacht (joblib, inkl. Chunk-Parameter im Cache-Key) und beim nächsten Start
+  sofort wiederverwendet
 - 🔑 API-Keys können im UI eingegeben oder als Umgebungsvariable gesetzt werden
+- 📌 **Transparente Quellenangaben**: jede RAG-Antwort zeigt aufklappbar, welche
+  Dokumenten-Abschnitte (inkl. Seitenzahl bei PDFs) und Relevanz-Scores
+  tatsächlich verwendet wurden
+- ⏹️ **Stopp-Button** zum Abbrechen einer laufenden Antwort
+- 💾 **Chat-Export** als Markdown-Datei
+- 🎭 **System-Prompt-Vorlagen** (Standard, Strikt/nur-aus-Dokument, Zusammenfassen, Kreativ)
+- 🛡️ **Robustheit**: Datei-/Größen-/Seitenlimits gegen versehentliche Riesen-Uploads,
+  verständliche deutsche Fehlermeldungen bei Rate-Limits (Groq/Gemini Free-Tier)
+- ✅ **35 automatisierte Tests** (pytest) für Chunking, Indexing, Provider-Fehlerbehandlung
 
 ## 🚀 Schnellstart
 
@@ -51,6 +61,7 @@ llm/
   providers.py          # Groq- & Gemini-Chat-/Embedding-Anbindung
 cache/                  # Persistierte Indizes (joblib, gitignored)
 uploads/                # Temporäre Uploads
+tests/                  # Pytest-Testsuite (rag/, llm/, app.py)
 ```
 
 ## 🛠️ Nutzung
@@ -59,7 +70,15 @@ uploads/                # Temporäre Uploads
 2. Dokumente hochladen und auf **„Dokumente indizieren"** klicken
 3. Such-Modus (TF-IDF oder Gemini-Embeddings) wählen
 4. Im Chat Fragen stellen – relevanter Dokumenten-Kontext wird automatisch
-   eingebunden, wenn **„RAG-Kontext verwenden"** aktiviert ist
+   eingebunden, wenn **„RAG-Kontext verwenden"** aktiviert ist; die verwendeten
+   Quellen lassen sich unter jeder Antwort aufklappen
+
+## 🧪 Tests
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
+```
 
 ## Lizenz
 

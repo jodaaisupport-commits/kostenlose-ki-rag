@@ -19,9 +19,16 @@ GEMINI_MODELS = [
 
 GEMINI_EMBEDDING_MODEL = "models/text-embedding-004"
 
+# Gemini erlaubt pro batch_embed_contents-Aufruf maximal 100 Inhalte.
+GEMINI_EMBEDDING_BATCH_SIZE = 100
+
 
 class ProviderError(RuntimeError):
-    pass
+    """Allgemeiner, dem Nutzer anzuzeigender Fehler eines LLM-Providers."""
+
+
+class RateLimitError(ProviderError):
+    """Spezifischer Fehler für erreichte Free-Tier-Rate-Limits."""
 
 
 def get_groq_client(api_key: Optional[str] = None):
@@ -49,6 +56,56 @@ def get_gemini_module(api_key: Optional[str] = None):
     return genai
 
 
+def _friendly_groq_error(e: Exception) -> ProviderError:
+    """Wandelt Groq-SDK-Fehler in verständliche, deutschsprachige Meldungen um."""
+    try:
+        import groq as groq_sdk
+
+        if isinstance(e, groq_sdk.RateLimitError):
+            return RateLimitError(
+                "⏳ Groq-Rate-Limit erreicht (Free-Tier). Bitte kurz warten "
+                "(meist 20-60 Sekunden) und erneut versuchen, oder ein kleineres "
+                "Modell wählen."
+            )
+        if isinstance(e, groq_sdk.AuthenticationError):
+            return ProviderError(
+                "🔑 Groq-API-Key ungültig oder abgelaufen. Bitte im UI-Feld prüfen "
+                "(https://console.groq.com/keys)."
+            )
+        if isinstance(e, groq_sdk.APIConnectionError):
+            return ProviderError("🌐 Verbindung zu Groq fehlgeschlagen. Bitte Internetverbindung prüfen.")
+        if isinstance(e, groq_sdk.APIStatusError):
+            return ProviderError(f"Groq-API-Fehler (Status {e.status_code}): {e.message}")
+    except ImportError:
+        pass
+    return ProviderError(f"Groq-Fehler: {e}")
+
+
+def _friendly_gemini_error(e: Exception) -> ProviderError:
+    """Wandelt Gemini-/google-api_core-Fehler in verständliche Meldungen um."""
+    try:
+        from google.api_core import exceptions as gexc
+
+        if isinstance(e, (gexc.ResourceExhausted, gexc.TooManyRequests)):
+            return RateLimitError(
+                "⏳ Gemini-Rate-Limit erreicht (Free-Tier). Bitte kurz warten "
+                "(meist 20-60 Sekunden) und erneut versuchen, oder ein anderes "
+                "Modell wählen."
+            )
+        if isinstance(e, gexc.Unauthenticated) or isinstance(e, gexc.PermissionDenied):
+            return ProviderError(
+                "🔑 Google-API-Key ungültig oder ohne Berechtigung. Bitte im UI-Feld prüfen "
+                "(https://aistudio.google.com/apikey)."
+            )
+        if isinstance(e, gexc.DeadlineExceeded):
+            return ProviderError("⏱️ Zeitüberschreitung bei Gemini. Bitte erneut versuchen.")
+        if isinstance(e, gexc.GoogleAPICallError):
+            return ProviderError(f"Gemini-API-Fehler: {e.message if hasattr(e, 'message') else e}")
+    except ImportError:
+        pass
+    return ProviderError(f"Gemini-Fehler: {e}")
+
+
 def stream_groq_completion(
     client,
     model: str,
@@ -72,8 +129,10 @@ def stream_groq_completion(
             delta = chunk.choices[0].delta.content if chunk.choices else None
             if delta:
                 yield delta
+    except ProviderError:
+        raise
     except Exception as e:
-        raise ProviderError(f"Groq-Fehler: {e}")
+        raise _friendly_groq_error(e)
 
 
 def stream_gemini_completion(
@@ -101,20 +160,35 @@ def stream_gemini_completion(
         for chunk in response:
             if chunk.text:
                 yield chunk.text
+    except ProviderError:
+        raise
     except Exception as e:
-        raise ProviderError(f"Gemini-Fehler: {e}")
+        raise _friendly_gemini_error(e)
 
 
 def make_gemini_embed_fn(genai_module):
+    """Erzeugt eine Embedding-Funktion, die Gemini's native Batch-API nutzt
+    (bis zu GEMINI_EMBEDDING_BATCH_SIZE Texte pro Request) statt pro Text
+    einen einzelnen API-Call abzusetzen.
+    """
+
     def embed_fn(texts: List[str]) -> List[List[float]]:
-        results = []
-        for t in texts:
-            resp = genai_module.embed_content(
-                model=GEMINI_EMBEDDING_MODEL,
-                content=t,
-                task_type="retrieval_document",
-            )
-            results.append(resp["embedding"])
+        if not texts:
+            return []
+        results: List[List[float]] = []
+        try:
+            for i in range(0, len(texts), GEMINI_EMBEDDING_BATCH_SIZE):
+                batch = texts[i : i + GEMINI_EMBEDDING_BATCH_SIZE]
+                resp = genai_module.embed_content(
+                    model=GEMINI_EMBEDDING_MODEL,
+                    content=batch,
+                    task_type="retrieval_document",
+                )
+                results.extend(resp["embedding"])
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise _friendly_gemini_error(e)
         return results
 
     return embed_fn

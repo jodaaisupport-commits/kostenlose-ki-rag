@@ -3,7 +3,8 @@ Gemini-Embeddings (optional, benötigt GOOGLE_API_KEY).
 
 Der Index wird pro Session im Arbeitsspeicher gehalten und zusätzlich
 als Cache-Datei (joblib) persistiert, damit ein erneutes Hochladen
-derselben Dokumente nicht erneut verarbeitet werden muss.
+derselben Dokumente mit denselben Einstellungen nicht erneut verarbeitet
+werden muss.
 """
 from __future__ import annotations
 
@@ -24,10 +25,23 @@ from .loader import extract_text
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Sicherheitsgrenzen für einen einzelnen Indizierungs-Vorgang.
+MAX_FILES_PER_INDEX = 20
+MAX_TOTAL_SIZE_MB = 100
 
-def _hash_files(file_paths: List[str]) -> str:
-    """Erzeugt einen stabilen Hash über Dateiinhalte + Namen für Cache-Keys."""
+
+class IndexLimitError(ValueError):
+    """Wird ausgelöst, wenn zu viele/zu große Dateien auf einmal indiziert werden sollen."""
+
+
+def _hash_files(file_paths: List[str], embedding_mode: str, chunk_size: int, overlap: int) -> str:
+    """Erzeugt einen stabilen Hash über Dateiinhalte + Namen + Indizierungs-
+    Parameter für den Cache-Key. Ändert sich chunk_size/overlap/Modus, wird
+    automatisch neu indiziert statt fälschlich ein alter Cache-Eintrag
+    zurückgegeben.
+    """
     hasher = hashlib.sha256()
+    hasher.update(f"mode={embedding_mode}|chunk={chunk_size}|overlap={overlap}".encode("utf-8"))
     for path in sorted(file_paths):
         hasher.update(os.path.basename(path).encode("utf-8"))
         try:
@@ -36,6 +50,25 @@ def _hash_files(file_paths: List[str]) -> str:
         except OSError:
             pass
     return hasher.hexdigest()[:24]
+
+
+def _check_limits(file_paths: List[str]) -> None:
+    if len(file_paths) > MAX_FILES_PER_INDEX:
+        raise IndexLimitError(
+            f"Zu viele Dateien auf einmal ({len(file_paths)}). "
+            f"Maximal {MAX_FILES_PER_INDEX} Dateien pro Indizierung erlaubt."
+        )
+    total_mb = 0.0
+    for p in file_paths:
+        try:
+            total_mb += os.path.getsize(p) / (1024 * 1024)
+        except OSError:
+            continue
+    if total_mb > MAX_TOTAL_SIZE_MB:
+        raise IndexLimitError(
+            f"Gesamtgröße der Uploads ({total_mb:.1f} MB) überschreitet das "
+            f"Limit von {MAX_TOTAL_SIZE_MB} MB."
+        )
 
 
 @dataclass
@@ -92,26 +125,32 @@ def build_or_load_index(
     if not file_paths:
         raise ValueError("Keine Dateien zum Indizieren übergeben.")
 
-    cache_key = _hash_files(file_paths)
+    chunk_size = max(1, int(chunk_size))
+    overlap = max(0, int(overlap))
+
+    _check_limits(file_paths)
+
+    cache_key = _hash_files(file_paths, embedding_mode, chunk_size, overlap)
     cache_file = _cache_path(cache_key, embedding_mode)
 
-    def _notify(msg: str):
+    def _notify(msg: str, frac: Optional[float] = None):
         if progress_cb:
-            progress_cb(msg)
+            progress_cb(msg, frac)
 
     if not force_rebuild and os.path.exists(cache_file):
         try:
-            _notify("📦 Lade zwischengespeicherten Index aus Cache ...")
+            _notify("📦 Lade zwischengespeicherten Index aus Cache ...", 0.5)
             index: RagIndex = joblib.load(cache_file)
             if index.is_ready:
+                _notify("✅ Index aus Cache geladen.", 1.0)
                 return index
         except Exception:
             pass  # Cache defekt -> neu bauen
 
-    _notify("📄 Extrahiere Text aus Dokumenten ...")
+    _notify("📄 Extrahiere Text aus Dokumenten ...", 0.0)
     all_chunks: List[Chunk] = []
     source_names: List[str] = []
-    for path in file_paths:
+    for file_idx, path in enumerate(file_paths):
         name = os.path.basename(path)
         source_names.append(name)
         try:
@@ -124,28 +163,36 @@ def build_or_load_index(
             continue
         chunks = chunk_text(text, source=name, chunk_size=chunk_size, overlap=overlap)
         all_chunks.extend(chunks)
+        _notify(
+            f"📄 {name} verarbeitet ({file_idx + 1}/{len(file_paths)}) ...",
+            0.1 + 0.2 * ((file_idx + 1) / max(1, len(file_paths))),
+        )
 
     if not all_chunks:
         raise ValueError("Es konnte kein verwertbarer Text aus den Dokumenten extrahiert werden.")
 
-    _notify(f"✂️ {len(all_chunks)} Text-Abschnitte erzeugt ...")
+    _notify(f"✂️ {len(all_chunks)} Text-Abschnitte erzeugt ...", 0.3)
 
     texts = [c.text for c in all_chunks]
 
     if embedding_mode == "gemini":
         if embed_fn is None:
             raise ValueError("embed_fn wird für Gemini-Embeddings benötigt (GOOGLE_API_KEY fehlt?)")
-        _notify("🧠 Erzeuge Gemini-Embeddings (kann etwas dauern) ...")
+        _notify("🧠 Erzeuge Gemini-Embeddings (kann etwas dauern) ...", 0.3)
         batch_size = 32
         vectors = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             vectors.extend(embed_fn(batch))
-            _notify(f"🧠 Embeddings: {min(i + batch_size, len(texts))}/{len(texts)}")
+            done = min(i + batch_size, len(texts))
+            _notify(
+                f"🧠 Embeddings: {done}/{len(texts)}",
+                0.3 + 0.6 * (done / len(texts)),
+            )
         matrix = np.array(vectors, dtype=np.float32)
         vectorizer = None
     else:
-        _notify("🔢 Berechne TF-IDF-Vektoren (lokal, kostenlos) ...")
+        _notify("🔢 Berechne TF-IDF-Vektoren (lokal, kostenlos) ...", 0.5)
         vectorizer = TfidfVectorizer(
             max_features=20000,
             ngram_range=(1, 2),
@@ -153,6 +200,7 @@ def build_or_load_index(
             sublinear_tf=True,
         )
         matrix = vectorizer.fit_transform(texts)
+        _notify("🔢 TF-IDF-Vektoren berechnet.", 0.9)
 
     index = RagIndex(
         chunks=all_chunks,
@@ -166,8 +214,8 @@ def build_or_load_index(
 
     try:
         joblib.dump(index, cache_file)
-        _notify("💾 Index im Cache gespeichert.")
+        _notify("💾 Index im Cache gespeichert.", 1.0)
     except Exception as e:
-        _notify(f"⚠️ Index konnte nicht gecacht werden: {e}")
+        _notify(f"⚠️ Index konnte nicht gecacht werden: {e}", 1.0)
 
     return index

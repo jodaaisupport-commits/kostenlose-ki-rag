@@ -9,17 +9,21 @@ Start: python app.py
 from __future__ import annotations
 
 import os
+import tempfile
+import time
 import traceback
 from typing import List, Optional
 
 import gradio as gr
 from dotenv import load_dotenv
 
-from rag.index_store import RagIndex, build_or_load_index
+from rag.index_store import IndexLimitError, RagIndex, build_or_load_index
+from rag.loader import DocumentTooLargeError
 from llm.providers import (
     GEMINI_MODELS,
     GROQ_MODELS,
     ProviderError,
+    RateLimitError,
     get_gemini_module,
     get_groq_client,
     make_gemini_embed_fn,
@@ -30,13 +34,34 @@ from llm.providers import (
 load_dotenv()
 
 APP_TITLE = "🆓 Kostenlose KI-RAG-Chat-App"
-DEFAULT_SYSTEM_PROMPT = (
-    "Du bist ein hilfreicher, präziser Assistent. "
-    "Wenn Kontext aus Dokumenten bereitgestellt wird, nutze ihn vorrangig, "
-    "um die Frage zu beantworten. Wenn die Antwort nicht im Kontext steht, "
-    "sage das ehrlich, anstatt zu raten. Antworte auf Deutsch, außer der "
-    "Nutzer schreibt in einer anderen Sprache."
-)
+
+SYSTEM_PROMPT_PRESETS = {
+    "Standard (ausgewogen)": (
+        "Du bist ein hilfreicher, präziser Assistent. "
+        "Wenn Kontext aus Dokumenten bereitgestellt wird, nutze ihn vorrangig, "
+        "um die Frage zu beantworten. Wenn die Antwort nicht im Kontext steht, "
+        "sage das ehrlich, anstatt zu raten. Antworte auf Deutsch, außer der "
+        "Nutzer schreibt in einer anderen Sprache."
+    ),
+    "Strikt (nur aus Dokument antworten)": (
+        "Du bist ein strenger Dokumenten-Assistent. Beantworte Fragen "
+        "AUSSCHLIESSLICH auf Basis des bereitgestellten Kontexts. "
+        "Steht die Antwort nicht eindeutig im Kontext, antworte wortwörtlich: "
+        "'Das steht nicht in den hochgeladenen Dokumenten.' Erfinde niemals "
+        "Informationen. Antworte auf Deutsch."
+    ),
+    "Zusammenfassen": (
+        "Du bist ein Assistent, der Inhalte prägnant zusammenfasst. "
+        "Fasse den bereitgestellten Kontext bzw. die Antwort in klaren, "
+        "kurzen Stichpunkten zusammen. Antworte auf Deutsch."
+    ),
+    "Kreativ": (
+        "Du bist ein kreativer, lockerer Assistent mit Humor. Nutze "
+        "bereitgestellten Dokumentenkontext als Inspiration, aber antworte "
+        "frei und unterhaltsam. Antworte auf Deutsch."
+    ),
+}
+DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT_PRESETS["Standard (ausgewogen)"]
 
 CUSTOM_CSS = """
 #title-row {text-align: center; margin-bottom: 0.5rem;}
@@ -50,20 +75,21 @@ footer {display: none !important;}
 # App-State-Helfer
 # --------------------------------------------------------------------------
 
-def build_context_snippet(index: Optional[RagIndex], query: str, embed_fn=None, top_k: int = 4) -> str:
+def build_context_snippet(
+    index: Optional[RagIndex], query: str, embed_fn=None, top_k: int = 4
+):
+    """Liefert (Kontext-String für den LLM-Prompt, Liste der verwendeten Treffer)."""
     if index is None or not index.is_ready:
-        return ""
-    try:
-        results = index.search(query, top_k=top_k, embed_fn=embed_fn)
-    except Exception:
-        return ""
+        return "", []
+    results = index.search(query, top_k=top_k, embed_fn=embed_fn)
     if not results:
-        return ""
+        return "", []
 
     parts = []
     for chunk, score in results:
-        parts.append(f"[Quelle: {chunk.source} | Relevanz: {score:.2f}]\n{chunk.text}")
-    return "\n\n---\n\n".join(parts)
+        page_info = f" | Seite {chunk.page}" if chunk.page else ""
+        parts.append(f"[Quelle: {chunk.source}{page_info} | Relevanz: {score:.2f}]\n{chunk.text}")
+    return "\n\n---\n\n".join(parts), results
 
 
 def format_sources_markdown(index: Optional[RagIndex]) -> str:
@@ -73,6 +99,23 @@ def format_sources_markdown(index: Optional[RagIndex]) -> str:
     lines = [f"- 📄 **{s}**" for s in unique_sources]
     lines.append(f"\n**{len(index.chunks)}** Text-Abschnitte indiziert · Modus: `{index.embedding_mode}`")
     return "\n".join(lines)
+
+
+def format_citation_markdown(results) -> str:
+    """Formatiert die tatsächlich verwendeten Such-Treffer als kompakte
+    Markdown-Liste, die als 'Gedanken'/Quellen-Block unter der Chat-Antwort
+    angezeigt wird (via gr.ChatMessage metadata).
+    """
+    if not results:
+        return "_Keine passenden Abschnitte gefunden._"
+    lines = []
+    for chunk, score in results:
+        page_info = f", Seite {chunk.page}" if chunk.page else ""
+        preview = chunk.text[:220].strip().replace("\n", " ")
+        if len(chunk.text) > 220:
+            preview += " …"
+        lines.append(f"**{chunk.source}{page_info}** (Relevanz {score:.2f})\n> {preview}")
+    return "\n\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -95,10 +138,10 @@ def handle_index_build(
 
     log_lines: List[str] = []
 
-    def progress_cb(msg: str):
+    def progress_cb(msg: str, frac: Optional[float] = None):
         log_lines.append(msg)
         try:
-            progress(0, desc=msg)
+            progress(frac if frac is not None else 0, desc=msg)
         except Exception:
             pass
 
@@ -118,6 +161,9 @@ def handle_index_build(
         )
         log_lines.append("✅ Index erfolgreich erstellt / geladen.")
         return index, "\n".join(log_lines), format_sources_markdown(index)
+    except (IndexLimitError, DocumentTooLargeError) as e:
+        log_lines.append(f"🚫 {e}")
+        return state_index, "\n".join(log_lines), format_sources_markdown(state_index)
     except ProviderError as e:
         log_lines.append(f"❌ {e}")
         return state_index, "\n".join(log_lines), format_sources_markdown(state_index)
@@ -131,9 +177,33 @@ def handle_clear_index():
     return None, "🗑️ Index zurückgesetzt.", format_sources_markdown(None)
 
 
+def handle_preset_change(preset_name: str):
+    return SYSTEM_PROMPT_PRESETS.get(preset_name, DEFAULT_SYSTEM_PROMPT)
+
+
 # --------------------------------------------------------------------------
 # Callback: Chat
 # --------------------------------------------------------------------------
+
+def _history_to_provider_messages(chat_history: List[dict]) -> List[dict]:
+    """Wandelt die Gradio-Chat-History in schlanke {role, content}-Messages
+    für die LLM-APIs um. Wichtig: nutzt dafür IMMER die ungekürzte
+    Original-Nutzerfrage (nicht den RAG-augmentierten Prompt), damit der
+    Kontext-Block aus früheren Turns nicht bei jeder neuen Anfrage erneut
+    mitgeschickt wird (sonst Token-/Rate-Limit-Explosion über die Zeit).
+    Zusätzlich werden Fehlermeldungen (❌/🚫/⏳-Präfix) aus der History
+    herausgefiltert, damit das Modell nicht auf alte Fehlertexte aufbaut.
+    """
+    messages = []
+    for msg in chat_history:
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if content.lstrip().startswith(("❌", "🚫", "⏳")):
+            continue
+        messages.append({"role": msg["role"], "content": content})
+    return messages
+
 
 def handle_chat(
     message: str,
@@ -150,39 +220,46 @@ def handle_chat(
     state_index,
 ):
     if not message or not message.strip():
-        yield chat_history, ""
+        yield chat_history, gr.update(value="", interactive=True), gr.update(visible=False)
         return
 
     chat_history = chat_history or []
+    # Original-Nutzerfrage wird so angezeigt UND so in der History belassen -
+    # der RAG-Kontext existiert nur für den aktuellen API-Call, s.u.
     chat_history.append({"role": "user", "content": message})
-    chat_history.append({"role": "assistant", "content": ""})
-    yield chat_history, ""
+    chat_history.append({"role": "assistant", "content": "⏳ Denke nach ..."})
+    yield chat_history, gr.update(value="", interactive=False), gr.update(visible=True)
 
-    # RAG-Kontext ggf. einbinden
+    # Saubere History (ohne die gerade angehängten 2 neuen Einträge, ohne
+    # Fehlermeldungen, ohne alte RAG-Kontextblöcke) für den LLM-Call.
+    history_for_llm = _history_to_provider_messages(chat_history[:-2])
+
+    # RAG-Kontext ggf. NUR für diesen einen Aufruf einbinden.
     augmented_message = message
-    context_note = ""
+    citation_results = []
     if use_rag and state_index is not None and state_index.is_ready:
         embed_fn = None
         try:
             if state_index.embedding_mode == "gemini":
                 genai_module = get_gemini_module(google_api_key or None)
                 embed_fn = make_gemini_embed_fn(genai_module)
-            context = build_context_snippet(state_index, message, embed_fn=embed_fn, top_k=int(top_k))
+            context, citation_results = build_context_snippet(
+                state_index, message, embed_fn=embed_fn, top_k=int(top_k)
+            )
             if context:
                 augmented_message = (
                     f"Nutze den folgenden Kontext aus hochgeladenen Dokumenten, um die Frage zu beantworten.\n\n"
                     f"=== KONTEXT ===\n{context}\n=== ENDE KONTEXT ===\n\n"
                     f"Frage: {message}"
                 )
-                context_note = f"\n\n_(📚 {min(int(top_k), len(state_index.chunks))} Kontext-Abschnitte verwendet)_"
         except ProviderError as e:
             chat_history[-1]["content"] = f"❌ {e}"
-            yield chat_history, ""
+            yield chat_history, gr.update(interactive=True), gr.update(visible=False)
             return
         except Exception:
             pass  # bei Fehler ohne Kontext fortfahren
 
-    history_for_llm = chat_history[:-2]  # ohne aktuelle leere Antwort & aktuelle Frage
+    chat_history[-1]["content"] = ""
 
     try:
         if provider == "Groq (empfohlen, sehr schnell)":
@@ -210,22 +287,49 @@ def handle_chat(
         for delta in stream:
             full_response += delta
             chat_history[-1]["content"] = full_response
-            yield chat_history, ""
+            yield chat_history, gr.update(interactive=False), gr.update(visible=True)
 
-        if context_note:
-            chat_history[-1]["content"] = full_response + context_note
-            yield chat_history, ""
+        if citation_results:
+            citation_md = format_citation_markdown(citation_results)
+            full_response += (
+                f"\n\n<details><summary>📚 {len(citation_results)} Quellen-Abschnitt(e) verwendet</summary>\n\n"
+                f"{citation_md}\n\n</details>"
+            )
+            chat_history[-1]["content"] = full_response
 
+        yield chat_history, gr.update(interactive=True), gr.update(visible=False)
+
+    except RateLimitError as e:
+        chat_history[-1]["content"] = f"⏳ {e}"
+        yield chat_history, gr.update(interactive=True), gr.update(visible=False)
     except ProviderError as e:
         chat_history[-1]["content"] = f"❌ {e}"
-        yield chat_history, ""
+        yield chat_history, gr.update(interactive=True), gr.update(visible=False)
     except Exception as e:
         chat_history[-1]["content"] = f"❌ Unerwarteter Fehler: {e}"
-        yield chat_history, ""
+        yield chat_history, gr.update(interactive=True), gr.update(visible=False)
 
 
 def handle_retry_clear():
     return []
+
+
+def handle_export_chat(chat_history: List[dict]):
+    """Exportiert den aktuellen Chatverlauf als Markdown-Datei zum Download."""
+    if not chat_history:
+        gr.Warning("Der Chat ist leer – nichts zu exportieren.")
+        return None
+
+    lines = [f"# Chat-Export – {time.strftime('%Y-%m-%d %H:%M:%S')}\n"]
+    for msg in chat_history:
+        role = "🧑 Nutzer" if msg.get("role") == "user" else "🤖 Assistent"
+        lines.append(f"### {role}\n\n{msg.get('content', '')}\n")
+
+    tmp_dir = tempfile.mkdtemp(prefix="chat_export_")
+    out_path = os.path.join(tmp_dir, f"chat_export_{int(time.time())}.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path
 
 
 # --------------------------------------------------------------------------
@@ -278,6 +382,11 @@ def build_app() -> gr.Blocks:
                         choices=GEMINI_MODELS, value=GEMINI_MODELS[0], label="Gemini-Modell"
                     )
                     temperature = gr.Slider(0.0, 1.5, value=0.3, step=0.05, label="Temperature")
+                    preset_dropdown = gr.Dropdown(
+                        choices=list(SYSTEM_PROMPT_PRESETS.keys()),
+                        value="Standard (ausgewogen)",
+                        label="System-Prompt-Vorlage",
+                    )
                     system_prompt = gr.Textbox(
                         label="System-Prompt",
                         value=DEFAULT_SYSTEM_PROMPT,
@@ -287,7 +396,7 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("📚 Dokumenten-RAG", open=True):
                     use_rag = gr.Checkbox(label="RAG-Kontext im Chat verwenden", value=True)
                     files = gr.File(
-                        label="PDF / TXT / MD hochladen",
+                        label="PDF / TXT / MD hochladen (max. 20 Dateien, 25 MB/Datei)",
                         file_count="multiple",
                         file_types=[".pdf", ".txt", ".md"],
                     )
@@ -298,8 +407,8 @@ def build_app() -> gr.Blocks:
                         label="Such-/Embedding-Modus",
                     )
                     with gr.Row():
-                        chunk_size = gr.Number(value=220, label="Chunk-Größe (Wörter)", precision=0)
-                        overlap = gr.Number(value=40, label="Überlappung (Wörter)", precision=0)
+                        chunk_size = gr.Number(value=220, label="Chunk-Größe (Wörter)", precision=0, minimum=20)
+                        overlap = gr.Number(value=40, label="Überlappung (Wörter)", precision=0, minimum=0)
                     top_k = gr.Slider(1, 10, value=4, step=1, label="Anzahl Kontext-Abschnitte (Top-K)")
 
                     with gr.Row():
@@ -318,6 +427,7 @@ def build_app() -> gr.Blocks:
                     height=560,
                     avatar_images=(None, None),
                     buttons=["copy"],
+                    render_markdown=True,
                 )
                 with gr.Row():
                     msg_box = gr.Textbox(
@@ -327,8 +437,11 @@ def build_app() -> gr.Blocks:
                         container=False,
                     )
                     send_btn = gr.Button("Senden", variant="primary", scale=1)
+                    stop_btn = gr.Button("⏹️ Stopp", scale=1, visible=False)
                 with gr.Row():
                     clear_chat_btn = gr.Button("🧹 Chat leeren")
+                    export_btn = gr.Button("💾 Chat exportieren (.md)")
+                export_file = gr.File(label="Download", visible=True, interactive=False)
 
         # ---------------- Events ----------------
         build_btn.click(
@@ -340,6 +453,11 @@ def build_app() -> gr.Blocks:
             fn=handle_clear_index,
             inputs=[],
             outputs=[index_state, index_status, sources_md],
+        )
+        preset_dropdown.change(
+            fn=handle_preset_change,
+            inputs=[preset_dropdown],
+            outputs=[system_prompt],
         )
 
         chat_inputs = [
@@ -356,11 +474,18 @@ def build_app() -> gr.Blocks:
             google_api_key,
             index_state,
         ]
-        chat_outputs = [chatbot, msg_box]
+        chat_outputs = [chatbot, msg_box, stop_btn]
 
-        msg_box.submit(fn=handle_chat, inputs=chat_inputs, outputs=chat_outputs)
-        send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=chat_outputs)
+        submit_event = msg_box.submit(fn=handle_chat, inputs=chat_inputs, outputs=chat_outputs)
+        click_event = send_btn.click(fn=handle_chat, inputs=chat_inputs, outputs=chat_outputs)
+        stop_btn.click(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            cancels=[submit_event, click_event],
+        )
         clear_chat_btn.click(fn=handle_retry_clear, inputs=[], outputs=[chatbot])
+        export_btn.click(fn=handle_export_chat, inputs=[chatbot], outputs=[export_file])
 
         gr.Markdown(
             "---\n"

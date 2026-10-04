@@ -7,9 +7,20 @@ from pypdf import PdfReader
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md"}
 
+# Sicherheitsgrenzen gegen versehentliche Riesen-Uploads, die die App
+# (Speicher, Rechenzeit) blockieren oder zum Absturz bringen könnten.
+MAX_FILE_SIZE_MB = 25
+MAX_PDF_PAGES = 1000
+
+
+class DocumentTooLargeError(ValueError):
+    """Wird ausgelöst, wenn eine Datei die konfigurierten Limits überschreitet."""
+
 
 def extract_text(file_path: str) -> str:
     """Extrahiert den Text-Inhalt einer Datei (PDF, TXT, MD)."""
+    _check_file_size(file_path)
+
     ext = os.path.splitext(file_path)[1].lower()
 
     if ext == ".pdf":
@@ -23,8 +34,26 @@ def extract_text(file_path: str) -> str:
         )
 
 
+def _check_file_size(file_path: str) -> None:
+    try:
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    except OSError:
+        return
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise DocumentTooLargeError(
+            f"Datei ist {size_mb:.1f} MB groß und überschreitet das Limit von "
+            f"{MAX_FILE_SIZE_MB} MB."
+        )
+
+
 def _extract_pdf_text(file_path: str) -> str:
     reader = PdfReader(file_path)
+    num_pages = len(reader.pages)
+    if num_pages > MAX_PDF_PAGES:
+        raise DocumentTooLargeError(
+            f"PDF hat {num_pages} Seiten und überschreitet das Limit von "
+            f"{MAX_PDF_PAGES} Seiten."
+        )
     pages_text = []
     for i, page in enumerate(reader.pages):
         try:
